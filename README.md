@@ -14,12 +14,15 @@ This project builds a complete pipeline — from raw web scraping to statistical
 ---
 
 ## 📁 Repository Structure
+
+```
 Skytrax-Airline-Review/
 │
 ├── airline_review_web_scraping.R   # Web scraping pipeline (Phase 1–3)
 ├── Final_Project.Rmd               # Full analysis report (EDA, modelling, clustering)
 ├── Airline_review.csv              # Dataset used for analysis (output of web scraping)
 └── README.md
+```
 
 ## 🗂️ Dataset
 
