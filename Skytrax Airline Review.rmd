@@ -1,0 +1,546 @@
+---
+title: "Spring2026 STSCI 5111 Final Report"
+author: "Siqi Chen, Lanjia Yuan, Wenlin Huang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: null
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+# /Users/wenlinhuang/Desktop/Spring 2026/5111/Project/Airline_review_full.csv
+# /Users/jasmineyuan/Desktop/Airline_review_full.csv
+rm(list=ls())
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(corrplot)
+library(broom)
+library(ggeffects)
+library(quantreg)
+```
+
+## Data Source and Background
+\newpage
+
+## Data Preprocessing
+
+```{r}
+# Read in raw_data, drop Review details and Route, change variable names to snake_case
+raw_data <- read.csv('/Users/wenlinhuang/Desktop/Spring 2026/5111/Project/Airline_review_full.csv')
+raw_data <- raw_data[, !(names(raw_data) %in% c("Review_Title", "Review.Date", "Review",  "Aircraft", "Verified", "Route"))]
+raw_data <- raw_data %>% clean_names()
+
+# Separate date_flown into fly_month and fly_year
+raw_data <- raw_data %>%
+  mutate(
+    date_temp = my(date_flown),
+    fly_month = factor(month(date_temp), levels = 1:12, labels = month.name),
+    fly_year  = year(date_temp)
+  ) %>%
+  select(-date_temp)
+raw_data <- raw_data %>%
+  filter(fly_year != 2012 & fly_year != 2013)
+
+
+# Change recommended to a binary numeric variable
+raw_data <- raw_data %>%
+  mutate(recommended_num = ifelse(recommended == "yes", 1, 0))
+
+# Check information, summary, and NA count of raw_data
+str(raw_data)
+summary(raw_data)
+colSums(is.na(raw_data))
+nrow(raw_data) 
+
+
+# --- Extract dataset for EDA and Drop NAs ---
+eda_data <- raw_data[, c('airline_name', "overall_rating", "type_of_traveller", 
+                         "seat_type", "seat_comfort", "cabin_staff_service", 
+                         "food_beverages", "ground_service", "value_for_money", 
+                         "recommended", "fly_year", "fly_month")]
+eda_data <- eda_data %>% drop_na()
+colSums(is.na(eda_data))
+nrow(eda_data) 
+
+
+# --- Extract dataset for Model and Drop NAs ---
+# Focus on variables of interest for modeling
+data_test <- raw_data[, c('seat_type','type_of_traveller', 'seat_comfort', 
+                          "cabin_staff_service", "ground_service", 
+                          "inflight_entertainment", "wifi_connectivity", 
+                          "value_for_money", "food_beverages", 
+                          "recommended_num", "overall_rating")]
+
+# Directly drop all rows containing any NA values
+data_test <- data_test %>% drop_na()
+
+# Check the cleaned data information
+colSums(is.na(data_test)) 
+summary(data_test)
+nrow(data_test) 
+
+# --- Define Variable Groups for Modeling ---
+# These vectors are required for the correlation matrix and logistic regression models below
+cat_cols <- c("seat_type", "type_of_traveller")
+num_cols <- c("seat_comfort", "cabin_staff_service", "ground_service", 
+              "inflight_entertainment", "wifi_connectivity", "value_for_money",
+              "food_beverages")
+```
+
+
+## EDA
+#### Q1 For each airline, count the number of reviews, average rating and recommended rate
+```{r}
+airline_stats <- eda_data %>%
+  group_by(airline_name) %>%
+  summarise(
+    total_reviews = n(),
+    recommend_rate = mean(recommended == "yes", na.rm = TRUE) * 100,
+    avg_rating = mean(overall_rating, na.rm = TRUE)
+  )
+
+top5_reviews <- airline_stats %>%
+  arrange(desc(total_reviews)) %>%
+  slice_head(n = 5)
+
+# Consider reviews > 10 airlines
+top5_recommend <- airline_stats %>%
+  filter(total_reviews > 100) %>%
+  arrange(desc(recommend_rate)) %>%
+  slice_head(n = 5)
+
+top5_rating <- airline_stats %>%
+  filter(total_reviews > 100) %>%
+  arrange(desc(avg_rating)) %>%
+  slice_head(n = 5)
+
+p1 <- ggplot(top5_reviews, aes(x = reorder(airline_name, total_reviews), y = total_reviews)) +
+  geom_bar(stat = "identity", fill = "#4c78a8") +
+  geom_text(aes(label = total_reviews), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  labs(title = "Top 5 Airlines by Review Count", x = "Airline Name", y = "Total Reviews") +
+  theme_minimal()
+
+p2 <- ggplot(top5_recommend, aes(x = reorder(airline_name, recommend_rate), y = recommend_rate)) +
+  geom_bar(stat = "identity", fill = "#f58518") +
+  geom_text(aes(label = paste0(round(recommend_rate, 1), "%")), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Top 5 Airlines by Recommend Rate (Min. 100 Reviews)", 
+       x = "Airline Name", y = "Recommend Rate (%)") +
+  theme_minimal()
+
+p3 <- ggplot(top5_rating, aes(x = reorder(airline_name, avg_rating), y = avg_rating)) +
+  geom_bar(stat = "identity", fill = "#e45756") +
+  geom_text(aes(label = round(avg_rating, 1)), hjust = -0.3, size = 3.5) +
+  coord_flip() +
+  labs(title = "Top 5 Airlines by Average Rating (Min. 100 Reviews)", 
+       x = "Airline Name", y = "Average Rating") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 1)
+```
+
+
+#### Q2 Which airline company has most value for money?
+```{r}
+vfm_stats <- eda_data %>%
+  group_by(airline_name) %>%
+  summarise(
+    avg_vfm = mean(value_for_money, na.rm = TRUE),
+    review_count = n()
+  ) %>%
+  filter(review_count >= 100) %>%
+  arrange(desc(avg_vfm)) %>%
+  slice_head(n = 5)
+
+ggplot(vfm_stats, aes(x = reorder(airline_name, avg_vfm), y = avg_vfm)) +
+  geom_bar(stat = "identity", fill = "#2ca02c") +
+  geom_text(aes(label = round(avg_vfm, 2)), hjust = -0.2) +
+  coord_flip(clip = "off") +
+  labs(title = "Top 5 Airlines: Value For Money (Min. 100 Reviews)",
+       x = "Airline Name", y = "Average VFM Score") +
+  theme_minimal()
+```
+
+#### Q3 Rating Diversification
+```{r}
+polar_stats <- eda_data %>%
+  group_by(airline_name) %>%
+  summarise(
+    rating_sd = sd(overall_rating, na.rm = TRUE),
+    avg_rating = mean(overall_rating, na.rm = TRUE),
+    review_count = n()
+  ) %>%
+  filter(review_count >= 100) %>% 
+  arrange(desc(rating_sd)) %>%
+  slice_head(n = 5)
+
+ggplot(polar_stats, aes(x = reorder(airline_name, rating_sd), y = rating_sd)) +
+  geom_point(size = 4, color = "#d62728") +
+  geom_segment(aes(x = airline_name, xend = airline_name, y = 0, yend = rating_sd), color = "gray") +
+  geom_text(aes(label = round(rating_sd, 2)), vjust = -1) +
+  coord_flip(clip = "off") +
+  labs(title = "Top 5 Most Polarized Airlines (Highest Rating SD)",
+       subtitle = "High SD indicates inconsistent customer experiences",
+       x = "Airline Name", y = "Standard Deviation of Overall Rating") +
+  theme_minimal()
+```
+
+##### Akasa Airline
+```{r}
+akasa_data <- eda_data %>% filter(airline_name == "Akasa Air")
+
+ggplot(akasa_data, aes(x = overall_rating)) +
+  geom_histogram(binwidth = 1, fill = "#69b3a2", color = "white", alpha = 0.8) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Rating Distribution: Akasa Air",
+    subtitle = "Evidence of Polarization (Bimodal Distribution)",
+    x = "Overall Rating",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+ggplot(akasa_data, aes(x = overall_rating, fill = seat_type)) +
+  geom_histogram(binwidth = 1, position = "dodge", alpha = 0.7) +
+  scale_x_continuous(breaks = 1:10) +
+  facet_wrap(~seat_type, scales = "free_y") + 
+  labs(
+    title = "Rating Distribution by Seat Type",
+    x = "Overall Rating",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(akasa_data, aes(x = overall_rating, fill = type_of_traveller)) +
+  geom_density(alpha = 0.4) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Density of Ratings by Traveller Type",
+    subtitle = "Comparison of Sentiment Peaks",
+    x = "Overall Rating",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+#### Q4 Any contradiction data? (Low rating, high recommendate rate)
+```{r}
+comparison <- eda_data %>%
+  dplyr::filter(overall_rating < 5) %>% 
+  dplyr::mutate(group = ifelse(recommended == "yes", 
+                        "Low Rating but Recommended", 
+                        "Low Rating & Not Recommended")) %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(across(c(seat_comfort, cabin_staff_service, food_beverages, 
+                     ground_service, value_for_money), 
+                   ~mean(.x, na.rm = TRUE))) %>% 
+  tidyr::pivot_longer(cols = -group, names_to = "service_type", values_to = "avg_score")
+
+service_order <- comparison %>%
+  filter(group == "Low Rating but Recommended") %>%
+  arrange(avg_score) %>%
+  pull(service_type)
+comparison$service_type <- factor(comparison$service_type, levels = service_order)
+
+ggplot(comparison, aes(x = service_type, y = avg_score, fill = group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  geom_text(aes(label = round(avg_score, 2)), 
+            position = position_dodge(width = 0.8), 
+            hjust = -0.2, size = 3.5) +
+  coord_flip(clip = "off") + 
+  labs(title = "Why recommend despite low overall rating?",
+       subtitle = "Ordered by 'Low Rating but Recommended' scores",
+       x = "Service Categories", y = "Average Score (1-5)") +
+  scale_fill_manual(values = c("#d62728", "#1f77b4")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+#### Q5 Any seasonal effect in rating/review of airline company?
+```{r}
+eda_data$fly_month <- factor(eda_data$fly_month, levels = month.name)
+
+monthly_stats <- eda_data %>%
+  group_by(fly_month) %>%
+  summarise(
+    avg_rating = mean(overall_rating, na.rm = TRUE),
+    review_count = n()
+  )
+
+p_count <- ggplot(monthly_stats, aes(x = fly_month, y = review_count, group = 1)) +
+  geom_line(color = "#1f77b4", size = 1) +
+  geom_point(color = "#1f77b4", size = 2) +
+  geom_text(aes(label = review_count), vjust = -0.8, size = 3) + 
+  labs(title = "Monthly Review Volume (Q8)", x = "Month", y = "Number of Reviews") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_rating <- ggplot(monthly_stats, aes(x = fly_month, y = avg_rating, group = 1)) +
+  geom_line(color = "#ff7f0e", size = 1) +
+  geom_point(color = "#ff7f0e", size = 2) +
+  geom_text(aes(label = round(avg_rating, 2)), vjust = -0.8, size = 3) + 
+  coord_cartesian(ylim = c(min(monthly_stats$avg_rating)-0.5, max(monthly_stats$avg_rating)+0.5)) +
+  labs(title = "Average Rating by Month (Q6)", x = "Month", y = "Average Overall Rating") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+grid.arrange(p_count, p_rating, ncol = 1)
+```
+
+#### Q6 Past year total recommend rate
+```{r}
+yearly_stats <- eda_data %>%
+  filter(!is.na(fly_year)) %>%
+  group_by(fly_year) %>%
+  summarise(
+    avg_rating = mean(overall_rating, na.rm = TRUE),
+    recommend_rate = mean(recommended == "yes", na.rm = TRUE) * 100
+  )
+
+ggplot(yearly_stats, aes(x = fly_year, y = avg_rating)) +
+  geom_line(color = "#2ca02c", size = 1) +
+  geom_point(size = 3) +
+  geom_text(aes(label = round(avg_rating, 2)), vjust = -1, fontface = "bold") +
+  labs(title = "Q7: Industry-wide Annual Satisfaction Trend",
+       x = "Year", y = "Average Overall Rating") +
+  theme_minimal()
+```
+
+
+## Analysis
+### Correlation Analysis using service variables
+```{r}
+service_vars <- data_test %>% select(num_cols)
+cor_matrix <- cor(service_vars, use = "complete.obs")
+cor_matrix
+```
+
+```{r}
+# Correlation Heatmap
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.cex = 0.8
+)
+```
+
+```{r}
+# Correlation with response variable
+cor(data_test$recommended_num, service_vars, use = "complete.obs")
+```
+
+### Logistic regression (baseline model)
+```{r}
+formula_baseline <- as.formula(
+  paste("recommended_num ~", paste(num_cols, collapse = " + ")))
+
+model1 <- glm(formula_baseline, data = data_test, family = binomial)
+
+summary(model1)
+exp(coef(model1))  # Odds Ratio
+```
+
+```{r}
+# Show the results
+model1_tidy <- tidy(model1) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "Model 1: Service Factors")
+
+plot_model1 <- ggplot(model1_tidy,
+       aes(x = reorder(term, estimate), y = estimate)) +
+  geom_point(size = 2, color = "#2C7BB6") +
+  geom_errorbar(aes(ymin = estimate - 1.96*std.error,
+                    ymax = estimate + 1.96*std.error),
+                width = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Model 1: Effects of Service Factors on Airline Recommendation",
+    x = "",
+    y = "Logistic Regression Coefficient"
+  ) +
+  theme_minimal(base_size = 14)
+
+plot_model1
+```
+
+### Logistic Model (Service variables + customer characteristics)
+```{r}
+model2_vars <- c(num_cols, cat_cols)
+
+formula_model2 <- as.formula(
+  paste("recommended_num ~", paste(model2_vars, collapse = " + ")))
+
+model2 <- glm(formula_model2, data = data_test, family = binomial)
+
+summary(model2)
+exp(coef(model2))
+```
+
+```{r}
+# Show the results
+model2_tidy <- tidy(model2) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "Model 2: + Customer Characteristics")
+
+plot_model2 <- ggplot(model2_tidy,
+       aes(x = reorder(term, estimate), y = estimate)) +
+  geom_point(size = 2, color = "#D7191C") +
+  geom_errorbar(aes(ymin = estimate - 1.96*std.error,
+                    ymax = estimate + 1.96*std.error),
+                width = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Model 2: Service Factors + Customer Characteristics",
+    x = "",
+    y = "Logistic Regression Coefficient"
+  ) +
+  theme_minimal(base_size = 14)
+
+plot_model2
+
+```
+
+
+#### Model Comparison
+```{r}
+anova_result <- anova(model1, model2, test = "Chisq")
+anova_result
+AIC(model1, model2)
+```
+
+### Model3: with interaction term
+```{r}
+model3 <- glm(
+  recommended_num ~
+    seat_comfort * seat_type +
+    value_for_money * type_of_traveller +
+    cabin_staff_service +
+    ground_service +
+    inflight_entertainment +
+    wifi_connectivity +
+    food_beverages,
+  data = data_test,
+  family = binomial
+)
+
+summary(model3)
+```
+
+```{r}
+anova(model2, model3, test = "Chisq")
+```
+
+```{r}
+interaction_plot <- ggpredict(model3, 
+                              terms = c("seat_comfort", "seat_type"))
+
+ggplot(interaction_plot,
+       aes(x = x, y = predicted, color = group)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 2) +
+  labs(
+    title = "Interaction Effect: Seat Comfort × Seat Type",
+    x = "Seat Comfort Rating",
+    y = "Predicted Probability of Recommendation",
+    color = "Seat Type"
+  ) +
+  theme_minimal(base_size = 15)
+
+```
+### Principal Component Analysis (PCA)
+```{r}
+# Step 1: Select numeric service variables and standardize
+pca_data <- data_test %>%
+  select(all_of(num_cols))
+
+# Step 2 & 3: Run PCA with scaling
+pca_model <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+
+# Step 4: Examine variance explained
+summary(pca_model)
+
+# Step 5: Scree plot to visualize variance
+plot(pca_model, type = "l", main = "PCA Scree Plot")
+
+# Step 6: View Loadings for the first two Principal Components
+pca_model$rotation[, 1:2]
+
+# Step 7: Add Top 2 PCs back to our dataset for later use
+data_test$PC1 <- pca_model$x[,1]
+data_test$PC2 <- pca_model$x[,2]
+```
+
+### K-Means Clustering (Customer Segmentation)
+#### This chunk uses the principal components to find distinct clusters of passenger experiences.
+```{r}
+# Step 1: Use the first 3 Principal Components for clustering
+cluster_data <- pca_model$x[, 1:3]
+
+# Step 2: Determine optimal clusters using the Elbow Method
+wss <- sapply(1:10, function(k) {
+  kmeans(cluster_data, centers = k, nstart = 10)$tot.withinss
+})
+plot(1:10, wss, type = "b", pch = 19, frame = FALSE, 
+     xlab = "Number of clusters K",
+     ylab = "Total within-clusters sum of squares",
+     main = "Elbow Method for Optimal K")
+
+# Step 3: Run K-means (assuming 3 clusters based on typical elbow plots)
+set.seed(123)
+kmeans_model <- kmeans(cluster_data, centers = 3, nstart = 25)
+
+# Step 4: Assign clusters to the dataset
+data_test$cluster <- as.factor(kmeans_model$cluster)
+
+# Step 5: Profile the clusters by calculating the mean of original service variables
+cluster_profiles <- data_test %>%
+  group_by(cluster) %>%
+  summarise(across(all_of(num_cols), \(x) mean(x, na.rm = TRUE)))
+print(cluster_profiles)
+
+# Step 6: Visualize clusters on the first two Principal Components
+ggplot(data_test, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Customer Segments visualized on PC1 and PC2",
+       x = "Principal Component 1 (Overall Service)",
+       y = "Principal Component 2") +
+  theme_minimal()
+```
+
+### Quantile Regression (Overall Rating)
+#### This chunk sees how service factors impact ratings differently for highly satisfied versus dissatisfied passengers.
+```{r}
+# Define formula for quantile regression
+formula_qr <- as.formula(
+  paste("overall_rating ~", paste(num_cols, collapse = " + "))
+)
+
+# Fit models at 25th, 50th (median), and 75th percentiles
+model_q25 <- rq(formula_qr, tau = 0.25, data = data_test)
+model_q50 <- rq(formula_qr, tau = 0.50, data = data_test)
+model_q75 <- rq(formula_qr, tau = 0.75, data = data_test)
+
+# Compare coefficients to see how variable importance shifts across satisfaction levels
+summary(model_q25)
+summary(model_q50)
+summary(model_q75)
+```
+
+
+## Summary
+
+
